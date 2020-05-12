@@ -144,7 +144,7 @@ class ExportManager:
             if self._game_id in existing_csvs and dataset_id in existing_csvs[self._game_id]:
                 src_sql = existing_csvs[self._game_id][dataset_id]['sql']
                 os.rename(src_sql, sql_zip_path)
-            self._dumpToSQL(sql_dump_path=sql_dump_path, game_table=game_table, db_settings=db_settings, temp_table = f'{dataset_id}_{short_hash}')
+            # self._dumpToSQL(sql_dump_path=sql_dump_path, game_table=game_table, db_settings=db_settings, temp_table = f'{dataset_id}_{short_hash}')
             sql_zip_file = zipfile.ZipFile(sql_zip_path, "w", compression=zipfile.ZIP_DEFLATED)
             sql_zip_file.write(sql_dump_path, f"{dataset_id}/{dataset_id}_{short_hash}.sql")
             sql_zip_file.write(readme_path, f"{dataset_id}/readme.md")
@@ -172,8 +172,12 @@ class ExportManager:
     def _extractToCSVs(self, raw_csv_path: str, proc_csv_path: str, db_settings,
                        game_schema: Schema, game_table: GameTable, game_extractor: type) -> int:
         try:
-            tunnel, db  = utils.SQL.prepareDB(db_settings=settings["db_config"], ssh_settings=settings["ssh_config"])
-            db_cursor = db.cursor()
+            use_bigquery = bool(settings["bigquery_config"]["CREDENTIAL_PATH"])
+            use_bigquery = False
+            tunnel, db  = utils.SQL.prepareDB(db_settings=settings["db_config"], ssh_settings=settings["ssh_config"],
+                                              bigquery_settings=settings["bigquery_config"], use_bigquery=use_bigquery)
+            if not use_bigquery:
+                db_cursor = db.cursor()
             else:
                 db_cursor = db
             raw_csv_file = open(raw_csv_path, "w", encoding="utf-8")
@@ -201,32 +205,51 @@ class ExportManager:
 
             num_sess = len(game_table.session_ids)
             utils.Logger.toStdOut(f"Preparing to process {num_sess} sessions.", logging.INFO)
-            slice_size = self._settings["BATCH_SIZE"]
-            session_slices = [[game_table.session_ids[i] for i in
-                            range( j*slice_size, min((j+1)*slice_size - 1, num_sess) )] for j in
-                            range( 0, math.ceil(num_sess / slice_size) )]
-            for next_slice in session_slices:
-                # grab data for the given session range. Sort by event time, so
-                select_query = self._select_query_from_slice(next_slice=next_slice, game_schema=game_schema)
-                self._select_queries.append(select_query)
-                next_data_set = utils.SQL.SELECTfromQuery(cursor=db_cursor, query=select_query, fetch_results=True)
-                # now, we process each row.
-                start = datetime.now()
-                for row in next_data_set:
-                    self._processRow(row, game_table, raw_mgr, proc_mgr)
-                time_delta = datetime.now() - start
-                num_min = math.floor(time_delta.total_seconds()/60)
-                num_sec = time_delta.total_seconds() % 60
-                num_events = len(next_data_set)
-                utils.Logger.toStdOut(f"Slice processing time: {num_min} min, {num_sec:.3f} sec to handle {num_events} events", logging.INFO)
-                utils.Logger.toFile(f"Slice processing time: {num_min} min, {num_sec:.3f} sec to handle {num_events} events", logging.INFO)
+            if not use_bigquery:
+                slice_size = self._settings["BATCH_SIZE"]
+                session_slices = [[game_table.session_ids[i] for i in
+                                range( j*slice_size, min((j+1)*slice_size, num_sess) )] for j in
+                                range( 0, math.ceil(num_sess / slice_size) )]
+                session_slices = session_slices[:2]
+                for next_slice in session_slices:
+                    # grab data for the given session range. Sort by event time, so
+                    select_query = self._select_query_from_slice(next_slice=next_slice, game_schema=game_schema, use_bigquery=use_bigquery)
+                    self._select_queries.append(select_query)
+                    next_data_set = utils.SQL.SELECTfromQuery(cursor=db_cursor, query=select_query, fetch_results=True,
+                                                              use_bigquery=use_bigquery)
+                    # now, we process each row.
+                    start = datetime.now()
+                    for row in next_data_set:
+                        self._processRow(row, game_table, raw_mgr, proc_mgr, use_bigquery=use_bigquery)
+                    time_delta = datetime.now() - start
+                    num_min = math.floor(time_delta.total_seconds()/60)
+                    num_sec = time_delta.total_seconds() % 60
+                    num_events = len(next_data_set)
+                    utils.Logger.toStdOut(f"Slice processing time: {num_min} min, {num_sec:.3f} sec to handle {num_events} events", logging.INFO)
+                    utils.Logger.toFile(f"Slice processing time: {num_min} min, {num_sec:.3f} sec to handle {num_events} events", logging.INFO)
+            else:
+                if self._game_id == 'LAKELAND' or self._game_id == 'JOWILDER':
+                    ver_filter = f" AND app_version in ({','.join([str(x) for x in game_schema.schema()['config']['SUPPORTED_VERS']])}) "
+                else:
+                    ver_filter = ''
+                table = settings["bigquery_config"]["table"]
+                db_name = settings["bigquery_config"]["DB_NAME_DATA"]
+                filt = f"app_id='{self._game_id}'{ver_filter}"
+                select_query = utils.SQL._prepareSelect(db_name=db_name,
+                                                 table=table, columns=None, filter=filt, limit=-1,
+                                                 sort_columns=["session_id", "session_n"], sort_direction="ASC",
+                                                 grouping=None, distinct=False)
+                data_set = utils.SQL.SELECTfromQuery(cursor=db_cursor, query=select_query, fetch_results=True,
+                                                     use_bigquery=use_bigquery)
+                for row in data_set:
+                    self._processRow(row, game_table, raw_mgr, proc_mgr, use_bigquery=use_bigquery)
                 
-                # after processing all rows for all slices, write out the session data and reset for next slice.
-                raw_mgr.WriteRawCSVLines()
-                raw_mgr.ClearLines()
-                proc_mgr.calculateAggregateFeatures()
-                proc_mgr.WriteProcCSVLines()
-                proc_mgr.ClearLines()
+            # after processing all rows for all slices, write out the session data and reset for next slice.
+            raw_mgr.WriteRawCSVLines()
+            raw_mgr.ClearLines()
+            proc_mgr.calculateAggregateFeatures()
+            proc_mgr.WriteProcCSVLines()
+            proc_mgr.ClearLines()
         except Exception as err:
             utils.Logger.toStdOut(str(err), logging.ERROR)
             traceback.print_tb(err.__traceback__)
@@ -235,14 +258,22 @@ class ExportManager:
             utils.SQL.disconnectMySQLViaSSH(tunnel=tunnel, db=db)
             return
 
-    def _select_query_from_slice(self, next_slice: list, game_schema: Schema):
+    def _select_query_from_slice(self, next_slice: list, game_schema: Schema, use_bigquery: bool = False):
         if self._game_id == 'LAKELAND' or self._game_id == 'JOWILDER':
             ver_filter = f" AND app_version in ({','.join([str(x) for x in game_schema.schema()['config']['SUPPORTED_VERS']])}) "
         else:
             ver_filter = ''
-        filt = f"app_id='{self._game_id}' AND (session_id  BETWEEN '{next_slice[0]}' AND '{next_slice[-1]}'){ver_filter}"
-        query = utils.SQL._prepareSelect(db_name=settings["db_config"]["DB_NAME_DATA"],
-                                         table=settings["db_config"]["table"], columns=None, filter=filt, limit=-1,
+        if not use_bigquery:
+            table = settings["db_config"]["table"]
+            db_name = settings["db_config"]["DB_NAME_DATA"]
+        else:
+            table = settings["bigquery_config"]["table"]
+            db_name = settings["bigquery_config"]["DB_NAME_DATA"]
+#        filt = f"app_id='{self._game_id}' AND (session_id  BETWEEN '{next_slice[0]}' AND '{next_slice[-1]}'){ver_filter}"
+        slice_filter = "AND session_id IN (" + ', '.join([f"'{sid}'" for sid in next_slice]) + ")"
+        filt = f"app_id='{self._game_id}'{slice_filter}{ver_filter}"
+        query = utils.SQL._prepareSelect(db_name=db_name,
+                                         table=table, columns=None, filter=filt, limit=-1,
                                          sort_columns=["session_id", "session_n"], sort_direction="ASC",
                                          grouping=None, distinct=False)
         return query
@@ -297,20 +328,29 @@ class ExportManager:
     #                    table assiciated with the given game is structured. 
     #  @raw_mgr          An instance of RawManager used to track raw data.
     #  @proc_mgr         An instance of ProcManager used to extract and track feature data.
-    def _processRow(self, row: typing.Tuple, game_table: GameTable, raw_mgr: RawManager, proc_mgr: ProcManager):
-        session_id = row[game_table.session_id_index]
+    def _processRow(self, row: typing.Tuple, game_table: GameTable, raw_mgr: RawManager, proc_mgr: ProcManager, use_bigquery: bool = False):
+
 
         # parse out complex data from json
-        col = row[game_table.complex_data_index]
-        complex_data_parsed = json.loads(col) if (col is not None) else {"event_custom":row[game_table.event_index]}
+        if use_bigquery:
+            col = row['event_data_complex']
+            session_id = row['session_id']
+        else:
+            col = row[game_table.complex_data_index]
+            session_id = row[game_table.session_id_index]
+        try:
+            complex_data_parsed = json.loads(col) if (col is not None) else {"event_custom":row[game_table.event_index]}
+        except:
+            print("Error with col: ", col)
+            return
         # make sure we get *something* in the event_custom name
         # TODO: Make a better solution for games without event_custom fields in the logs themselves
         if self._game_id == 'LAKELAND' or self._game_id == 'JOWILDER':
             if type(complex_data_parsed) is not type({}):
                 complex_data_parsed = {"item": complex_data_parsed}
-            complex_data_parsed["event_custom"] = row[game_table.event_custom_index]
+            complex_data_parsed["event_custom"] = row[game_table.event_custom_index] if not use_bigquery else row["event_custom"]
         elif "event_custom" not in complex_data_parsed.keys():
-            complex_data_parsed["event_custom"] = row[game_table.event_index]
+            complex_data_parsed["event_custom"] = row[game_table.event_index] if not use_bigquery else row["event_custom"]
         # replace the json with parsed version.
         row = list(row)
         row[game_table.complex_data_index] = complex_data_parsed

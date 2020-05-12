@@ -18,5 +18,6 @@ settings = {
     },
     "MIN_MOVES":1,
     "BATCH_SIZE":1000,
-    "MAX_SESSIONS":-1
+    "MAX_SESSIONS":-1,
+    "CREDENTIAL_PATH": None # path/to/gcp/credentials.json (if using BigQuery)
 }

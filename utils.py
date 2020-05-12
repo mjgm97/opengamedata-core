@@ -10,6 +10,8 @@ import os
 import sshtunnel
 import traceback
 import typing
+from config import settings
+from google.cloud import bigquery
 
 ## Function to open a given JSON file, and retrieve the data as a Python object.
 #  @param filename  The name of the JSON file. If the file extension is not .json,
@@ -66,7 +68,15 @@ class SQL:
     ## Function to set up a connection to a database, via an ssh tunnel if available.
     #  @return A tuple consisting of the tunnel and database connection, respectively.
     @staticmethod
-    def prepareDB(db_settings, ssh_settings) -> typing.Tuple[object, object]:
+    def prepareDB(db_settings, ssh_settings, bigquery_settings=None, use_bigquery = False) -> typing.Tuple[object, object]:
+        if use_bigquery:
+            Logger.toStdOut("We're preparing database with bigquery.", logging.INFO)
+            os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = bigquery_settings["CREDENTIAL_PATH"]
+            try:
+                client = bigquery.Client()
+                return (None, client)
+            except:
+                Logger.toStdOut("Could not connect with bigquery.", logging.INFO)
         # Load settings, set up consts.
         DB_NAME_DATA = db_settings["DB_NAME_DATA"]
         DB_USER = db_settings['DB_USER']
@@ -188,17 +198,24 @@ class SQL:
     @staticmethod
     def SELECT(cursor, db_name: str, table:str, columns: typing.List[str] = None, filter: str = None, limit: int = -1,
                sort_columns: typing.List[str] = None, sort_direction = "ASC", grouping: str = None,
-               distinct: bool = False, fetch_results: bool = True) -> typing.List[typing.Tuple]:
+               distinct: bool = False, fetch_results: bool = True, use_bigquery: bool = False) -> typing.List[typing.Tuple]:
         query = SQL._prepareSelect(db_name=db_name, table=table, columns=columns, filter=filter, limit=limit,
                                    sort_columns=sort_columns, sort_direction=sort_direction, grouping=grouping,
                                    distinct=distinct)
-        return SQL.SELECTfromQuery(cursor=cursor, query=query, fetch_results=fetch_results)
+        return SQL.SELECTfromQuery(cursor=cursor, query=query, fetch_results=fetch_results, use_bigquery=use_bigquery)
     @staticmethod
-    def SELECTfromQuery(cursor, query: str, fetch_results: bool = True) -> typing.List[typing.Tuple]:
-        Logger.toStdOut("Running query: " + query, logging.INFO)
+    def SELECTfromQuery(cursor, query: str, fetch_results: bool = True, use_bigquery=False) -> typing.List[typing.Tuple]:
+
+        with_bigquery = " with bigquery" if use_bigquery else "without bigquery"
+        Logger.toStdOut(f"Running query{with_bigquery}: " + query, logging.INFO)
+
         # print(f"running query: {query}")
         start = datetime.datetime.now()
-        cursor.execute(query)
+        if not use_bigquery:
+            cursor.execute(query)
+            query_job = None
+        else:
+            query_job = cursor.query(query)
         time_delta = datetime.datetime.now()-start
         num_min = math.floor(time_delta.total_seconds()/60)
         num_sec = time_delta.total_seconds() % 60
@@ -206,11 +223,16 @@ class SQL:
         # print("Query execution completed, time to execute: {:d} min, {:.3f} sec".format( \
         #     math.floor(time_delta.total_seconds()/60), time_delta.total_seconds() % 60 ) \
         # )
-        result = cursor.fetchall() if fetch_results else None
+        if not use_bigquery:
+            result = cursor.fetchall() if fetch_results else None
+            num_results = len(result)
+        else:
+            result = query_job.result() if fetch_results else None
+            num_results = result.total_rows
         time_delta = datetime.datetime.now()-start
         num_min = math.floor(time_delta.total_seconds()/60)
         num_sec = time_delta.total_seconds() % 60
-        Logger.toStdOut(f"Query fetch completed, total query time:    {num_min:d} min, {num_sec:.3f} sec to get {len(result):d} rows", logging.INFO)
+        Logger.toStdOut(f"Query fetch completed, total query time:    {num_min:d} min, {num_sec:.3f} sec to get {num_results:d} rows", logging.INFO)
         # print("Query fetch completed, total query time:    {:d} min, {:.3f} sec to get {:d} rows".format( \
         #     math.floor(time_delta.total_seconds()/60), time_delta.total_seconds() % 60, len(result) ) \
         # )
@@ -234,12 +256,20 @@ class SQL:
         return sel_clause + where_clause + group_clause + sort_clause + lim_clause + ";"
 
     @staticmethod
-    def Query(cursor, query: str, fetch_results: bool = True) -> typing.List[typing.Tuple]:
+    def Query(cursor, query: str, fetch_results: bool = True, use_bigquery: bool = False) -> typing.List[typing.Tuple]:
         Logger.toStdOut("Running query: " + query, logging.INFO)
         start = datetime.datetime.now()
-        cursor.execute(query)
+        if not use_bigquery:
+            cursor.execute(query)
+            query_job = None
+        else:
+            query_job = cursor.query(query)
         Logger.toStdOut(f"Query execution completed, time to execute: {datetime.datetime.now()-start}", logging.INFO)
-        return [col[0] for col in cursor.fetchall()] if fetch_results else None
+        if not use_bigquery:
+            result = cursor.fetchall() if fetch_results else None
+        else:
+            result = query_job.result() if fetch_results else None
+        return [col[0] for col in result] if fetch_results else None
 
     ## Simple function to construct and log a nice server 500 error message.
     #  @param err_msg A more detailed error message with info to help debugging.
@@ -252,7 +282,7 @@ class SQL:
 class Logger:
     # Set up loggers
     err_logger = logging.getLogger("err_logger")
-    file_handler = logging.FileHandler("ExportErrorReport.log")
+    file_handler = logging.FileHandler("ExportErrorReport.log", encoding='utf-8')
     err_logger.addHandler(file_handler)
     err_logger.setLevel(level=logging.DEBUG)
     std_logger = logging.getLogger("std_logger")
